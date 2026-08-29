@@ -3,7 +3,7 @@ import dataclasses
 import logging
 import math
 import pathlib
-
+import time
 import imageio
 from libero.libero import benchmark
 from libero.libero import get_libero_path
@@ -141,7 +141,17 @@ def eval_libero(args: Args) -> None:
                         }
 
                         # Query model to get action
-                        action_chunk = client.infer(element)["actions"]
+                        # action_chunk = client.infer(element)["actions"]
+
+                        result = client.infer(element)
+                        action_chunk = result["actions"]
+
+                        logging.info(
+                            "Model inference latency: %.2f ms",
+                            result["policy_timing"]["infer_ms"],
+                        )
+
+
                         assert (
                             len(action_chunk) >= args.replan_steps
                         ), f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."

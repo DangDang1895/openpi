@@ -148,9 +148,27 @@ def eval_libero(args: Args) -> None:
                         )
                         inference_calls += 1
 
-                        if metadata.get("total_ms") is not None:
-                            logging.info("Model inference latency: %.2f ms", float(metadata["total_ms"]))
+                        component_ms = []
+                        for key in ("vit_ms", "encode_ms", "decode_ms"):
+                            try:
+                                value = float(metadata.get(key))
+                            except (TypeError, ValueError):
+                                value = None
+                            if value is not None and (not math.isfinite(value) or value < 0):
+                                value = None
+                            component_ms.append(value)
 
+                        # The server's total_ms excludes ViT; sum all three components instead.
+                        full_model_ms = (
+                            sum(component_ms) if all(value is not None for value in component_ms) else None
+                        )
+                        logging.info(
+                            "Model inference latency: vit_ms=%s, encode_ms=%s, decode_ms=%s, full_model_ms=%s",
+                            *(
+                                f"{value:.2f}" if value is not None else "N/A"
+                                for value in (*component_ms, full_model_ms)
+                            ),
+                        )
 
                         assert (
                             len(action_chunk) >= args.replan_steps

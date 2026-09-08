@@ -62,6 +62,18 @@ class Policy(BasePolicy):
         else:
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+            self._component_timing_enabled = all(
+                hasattr(model, name)
+                for name in (
+                    "encode_visual_tokens",
+                    "prefix_kv_from_visual",
+                    "sample_actions_from_cached_kv",
+                )
+            )
+            if self._component_timing_enabled:
+                self._encode_visual = nnx_utils.module_jit(model.encode_visual_tokens)
+                self._build_prefix_kv = nnx_utils.module_jit(model.prefix_kv_from_visual)
+                self._sample_from_cached_kv = nnx_utils.module_jit(model.sample_actions_from_cached_kv)
             self._rng = rng or jax.random.key(0)
 
     @override
@@ -88,12 +100,40 @@ class Policy(BasePolicy):
             sample_kwargs["noise"] = noise
 
         observation = _model.Observation.from_dict(inputs)
+        component_timing: dict[str, float] = {}
         start_time = time.monotonic()
+        if not self._is_pytorch_model and self._component_timing_enabled:
+            component_start = time.monotonic()
+            observation, visual_tokens, visual_mask = self._encode_visual(observation)
+            observation, visual_tokens, visual_mask = jax.block_until_ready(
+                (observation, visual_tokens, visual_mask)
+            )
+            component_timing["vit_ms"] = (time.monotonic() - component_start) * 1000.0
+
+            component_start = time.monotonic()
+            prefix_mask, kv_cache = self._build_prefix_kv(observation, visual_tokens, visual_mask)
+            prefix_mask, kv_cache = jax.block_until_ready((prefix_mask, kv_cache))
+            component_timing["llm_ms"] = (time.monotonic() - component_start) * 1000.0
+
+            component_start = time.monotonic()
+            actions = self._sample_from_cached_kv(
+                sample_rng_or_pytorch_device,
+                observation,
+                cached_kv_cache=kv_cache,
+                cached_prefix_mask=prefix_mask,
+                **sample_kwargs,
+            )
+            actions = jax.block_until_ready(actions)
+            component_timing["ae_ms"] = (time.monotonic() - component_start) * 1000.0
+        else:
+            actions = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
+            if not self._is_pytorch_model:
+                actions = jax.block_until_ready(actions)
+        model_time = time.monotonic() - start_time
         outputs = {
             "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
+            "actions": actions,
         }
-        model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
         else:
@@ -102,7 +142,16 @@ class Policy(BasePolicy):
         outputs = self._output_transform(outputs)
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
+            **component_timing,
         }
+        if component_timing:
+            logging.info(
+                "component_timing: vit_ms=%.3f llm_ms=%.3f ae_ms=%.3f total_ms=%.3f",
+                component_timing["vit_ms"],
+                component_timing["llm_ms"],
+                component_timing["ae_ms"],
+                model_time * 1000.0,
+            )
         return outputs
 
     @property

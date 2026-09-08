@@ -213,6 +213,113 @@ class Pi0(_model.BaseModel):
 
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
+    def encode_visual_tokens(
+        self,
+        observation: _model.Observation,
+    ) -> tuple[_model.Observation, jax.Array, jax.Array]:
+        """Encode observation images without running the language model."""
+        observation = _model.preprocess_observation(None, observation, train=False)
+        visual_tokens = []
+        visual_masks = []
+        for name in observation.images:
+            image_tokens, _ = self.PaliGemma.img(observation.images[name], train=False)
+            visual_tokens.append(image_tokens)
+            visual_masks.append(
+                einops.repeat(
+                    observation.image_masks[name],
+                    "b -> b v",
+                    v=image_tokens.shape[1],
+                )
+            )
+        if not visual_tokens:
+            raise ValueError("observation contains no images")
+        return (
+            observation,
+            jnp.concatenate(visual_tokens, axis=1),
+            jnp.concatenate(visual_masks, axis=1),
+        )
+
+    def prefix_kv_from_visual(
+        self,
+        observation: _model.Observation,
+        visual_tokens: jax.Array,
+        visual_mask: jax.Array,
+    ):
+        """Build the prefix KV cache from precomputed visual tokens."""
+        tokens = [visual_tokens]
+        input_mask = [visual_mask]
+        ar_mask = [False] * visual_tokens.shape[1]
+
+        if observation.tokenized_prompt is not None:
+            language_tokens = self.PaliGemma.llm(observation.tokenized_prompt, method="embed")
+            tokens.append(language_tokens)
+            input_mask.append(observation.tokenized_prompt_mask)
+            ar_mask += [False] * language_tokens.shape[1]
+
+        prefix_tokens = jnp.concatenate(tokens, axis=1)
+        prefix_mask = jnp.concatenate(input_mask, axis=1)
+        prefix_ar_mask = jnp.asarray(ar_mask, dtype=jnp.bool_)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        _, kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None],
+            mask=prefix_attn_mask,
+            positions=positions,
+        )
+        return prefix_mask, kv_cache
+
+    def sample_actions_from_cached_kv(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        cached_kv_cache,
+        cached_prefix_mask: jax.Array,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+    ) -> _model.Actions:
+        """Sample actions using an already computed prefix KV cache."""
+        dt = -1.0 / num_steps
+        batch_size = observation.state.shape[0]
+        if noise is None:
+            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+
+        def step(carry):
+            x_t, time = carry
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                observation, x_t, jnp.broadcast_to(time, batch_size)
+            )
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            prefix_attn_mask = einops.repeat(
+                cached_prefix_mask,
+                "b p -> b s p",
+                s=suffix_tokens.shape[1],
+            )
+            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+            positions = (
+                jnp.sum(cached_prefix_mask, axis=-1)[:, None]
+                + jnp.cumsum(suffix_mask, axis=-1)
+                - 1
+            )
+
+            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=positions,
+                kv_cache=cached_kv_cache,
+                adarms_cond=[None, adarms_cond],
+            )
+            assert prefix_out is None
+            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            return x_t + dt * v_t, time + dt
+
+        def cond(carry):
+            _, time = carry
+            return time >= -dt / 2
+
+        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+        return x_0
+
     @override
     def sample_actions(
         self,

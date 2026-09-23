@@ -95,6 +95,8 @@ class PI0Pytorch(nn.Module):
             action_expert_config,
             use_adarms=[False, True] if self.pi05 else [False, False],
             precision=config.dtype,
+            image_size=config.image_resolution[0],
+            vision_output_grid=config.vision_output_grid,
         )
 
         self.action_in_proj = nn.Linear(config.action_dim, action_expert_config.width)
@@ -161,7 +163,13 @@ class PI0Pytorch(nn.Module):
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
-        observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
+        # observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
+        observation = _preprocessing.preprocess_observation_pytorch(
+            observation,
+            train=train,
+            image_keys=self.config.image_keys,
+            image_resolution=self.config.image_resolution,
+        )
         return (
             list(observation.images.values()),
             list(observation.image_masks.values()),

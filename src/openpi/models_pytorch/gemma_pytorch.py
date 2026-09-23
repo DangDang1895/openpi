@@ -1,5 +1,5 @@
 from typing import Literal
-
+import math
 import torch
 from torch import nn
 from transformers import GemmaForCausalLM
@@ -15,11 +15,13 @@ class PaliGemmaWithExpertModel(nn.Module):
         action_expert_config,
         use_adarms=None,
         precision: Literal["bfloat16", "float32"] = "bfloat16",
+        image_size: int = 224,
+        vision_output_grid: tuple[int, int] | None = None,
     ):
         if use_adarms is None:
             use_adarms = [False, False]
         super().__init__()
-
+        self.vision_output_grid = vision_output_grid
         vlm_config_hf = CONFIG_MAPPING["paligemma"]()
         vlm_config_hf._vocab_size = 257152  # noqa: SLF001
         vlm_config_hf.image_token_index = 257152
@@ -53,6 +55,9 @@ class PaliGemmaWithExpertModel(nn.Module):
             adarms_cond_dim=action_expert_config.width if use_adarms[1] else None,
         )
 
+        vlm_config_hf.vision_config.image_size = image_size
+        vlm_config_hf.vision_config.vision_use_head = False
+
         self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
         self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
         self.gemma_expert.model.embed_tokens = None
@@ -81,8 +86,29 @@ class PaliGemmaWithExpertModel(nn.Module):
             if any(selector in name for selector in params_to_keep_float32):
                 param.data = param.data.to(dtype=torch.float32)
 
+    # def embed_image(self, image: torch.Tensor):
+    #     return self.paligemma.model.get_image_features(image)
+
     def embed_image(self, image: torch.Tensor):
-        return self.paligemma.model.get_image_features(image)
+        features = self.paligemma.vision_tower(image).last_hidden_state
+
+        if self.vision_output_grid is not None:
+            batch, token_count, channels = features.shape
+            side = math.isqrt(token_count)
+            out_h, out_w = self.vision_output_grid
+            if side * side != token_count or side % out_h or side % out_w:
+                raise ValueError(
+                    f"Cannot pool {token_count} tokens to {self.vision_output_grid}"
+                )
+            features = (
+                features.reshape(
+                    batch, out_h, side // out_h, out_w, side // out_w, channels
+                )
+                .mean(dim=(2, 4))
+                .reshape(batch, out_h * out_w, channels)
+            )
+
+        return self.paligemma.model.multi_modal_projector(features)
 
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.paligemma.language_model.embed_tokens(tokens)

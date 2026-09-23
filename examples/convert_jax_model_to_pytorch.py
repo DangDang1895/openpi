@@ -517,12 +517,19 @@ def convert_pi0_checkpoint(
     all_params = {**paligemma_params, **gemma_params, **projection_params}
 
     # Load state dict
-    pi0_model.load_state_dict(all_params, strict=False)
+    # pi0_model.load_state_dict(all_params, strict=False)
+    load_result = pi0_model.load_state_dict(all_params, strict=False)
+    print("Missing keys:", load_result.missing_keys)
+    print("Unexpected keys:", load_result.unexpected_keys)
 
     if precision == "float32":
         pi0_model = pi0_model.to(torch.float32)
+    # elif precision == "bfloat16":
+    #     pi0_model = pi0_model.to(torch.bfloat16)
     elif precision == "bfloat16":
-        pi0_model = pi0_model.to(torch.bfloat16)
+        for name, submodule in pi0_model.named_children():
+            if name != "paligemma_with_expert":
+                submodule.to(torch.bfloat16)
     else:
         raise ValueError(f"Invalid precision: {precision}")
 
@@ -533,7 +540,8 @@ def convert_pi0_checkpoint(
     safetensors.torch.save_model(pi0_model, os.path.join(output_path, "model.safetensors"))
 
     # Copy assets folder if it exists
-    assets_source = pathlib.Path(checkpoint_dir).parent / "assets"
+    # assets_source = pathlib.Path(checkpoint_dir).parent / "assets"
+    assets_source = pathlib.Path(checkpoint_dir) / "assets"
     if assets_source.exists():
         assets_dest = pathlib.Path(output_path) / "assets"
         if assets_dest.exists():
@@ -541,13 +549,31 @@ def convert_pi0_checkpoint(
         shutil.copytree(assets_source, assets_dest)
 
     # Save config as JSON for reference
+    # config_dict = {
+    #     "action_dim": model_config.action_dim,
+    #     "action_horizon": model_config.action_horizon,
+    #     "paligemma_variant": model_config.paligemma_variant,
+    #     "action_expert_variant": model_config.action_expert_variant,
+    #     "precision": precision,
+    # }
+
     config_dict = {
+        "pi05": model_config.pi05,
         "action_dim": model_config.action_dim,
         "action_horizon": model_config.action_horizon,
+        "max_token_len": model_config.max_token_len,
+        "image_keys": list(model_config.image_keys),
+        "image_resolution": list(model_config.image_resolution),
+        "vision_output_grid": (
+            list(model_config.vision_output_grid)
+            if model_config.vision_output_grid is not None
+            else None
+        ),
         "paligemma_variant": model_config.paligemma_variant,
         "action_expert_variant": model_config.action_expert_variant,
         "precision": precision,
     }
+
     with open(os.path.join(output_path, "config.json"), "w") as f:
         json.dump(config_dict, f, indent=2)
 

@@ -558,6 +558,20 @@ class TrainConfig:
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
+
+    TrainConfig(
+        name="pi05_cyborg",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            max_token_len=80,
+            image_keys=("base_0_rgb", "right_wrist_0_rgb"),
+            image_resolution=(448, 448),
+            vision_output_grid=(16, 16),
+            pytorch_compile_mode=None,
+        ),
+    ),
     #
     # Inference Aloha configs.
     #

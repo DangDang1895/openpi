@@ -3,6 +3,7 @@ import dataclasses
 import logging
 import math
 import pathlib
+import time
 
 import imageio
 from libero.libero import benchmark
@@ -74,6 +75,10 @@ def eval_libero(args: Args) -> None:
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
+    suite_control_steps_all: list[int] = []
+    suite_control_steps_success: list[int] = []
+    suite_elapsed_s_all: list[float] = []
+    suite_elapsed_s_success: list[float] = []
     for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
         # Get task
         task = task_suite.get_task(task_id)
@@ -86,6 +91,10 @@ def eval_libero(args: Args) -> None:
 
         # Start episodes
         task_episodes, task_successes = 0, 0
+        task_control_steps_all: list[int] = []
+        task_control_steps_success: list[int] = []
+        task_elapsed_s_all: list[float] = []
+        task_elapsed_s_success: list[float] = []
         for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
             logging.info(f"\nTask: {task_description}")
 
@@ -99,6 +108,9 @@ def eval_libero(args: Args) -> None:
             # Setup
             t = 0
             replay_images = []
+            done = False
+            ep_control_steps = 0
+            episode_start_s: float | None = None
 
             logging.info(f"Starting episode {task_episodes+1}...")
             while t < max_steps + args.num_steps_wait:
@@ -109,6 +121,9 @@ def eval_libero(args: Args) -> None:
                         obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
                         t += 1
                         continue
+
+                    if episode_start_s is None:
+                        episode_start_s = time.perf_counter()
 
                     # Get preprocessed image
                     # IMPORTANT: rotate 180 degrees to match train preprocessing
@@ -151,6 +166,7 @@ def eval_libero(args: Args) -> None:
 
                     # Execute action in environment
                     obs, reward, done, info = env.step(action.tolist())
+                    ep_control_steps += 1
                     if done:
                         task_successes += 1
                         total_successes += 1
@@ -160,6 +176,25 @@ def eval_libero(args: Args) -> None:
                 except Exception as e:
                     logging.error(f"Caught exception: {e}")
                     break
+
+            episode_elapsed_s = (
+                time.perf_counter() - episode_start_s if episode_start_s is not None else None
+            )
+            logging.info(
+                "Episode result: task=%r episode=%d success=%s elapsed_s=%s control_steps=%d",
+                task_description,
+                episode_idx + 1,
+                done,
+                f"{episode_elapsed_s:.3f}" if episode_elapsed_s is not None else "NA",
+                ep_control_steps,
+            )
+            if episode_elapsed_s is not None:
+                task_elapsed_s_all.append(episode_elapsed_s)
+                if done:
+                    task_elapsed_s_success.append(episode_elapsed_s)
+            task_control_steps_all.append(ep_control_steps)
+            if done:
+                task_control_steps_success.append(ep_control_steps)
 
             task_episodes += 1
             total_episodes += 1
@@ -178,12 +213,57 @@ def eval_libero(args: Args) -> None:
             logging.info(f"# episodes completed so far: {total_episodes}")
             logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
 
+        task_total_elapsed_s = sum(task_elapsed_s_all)
+        task_total_control_steps = sum(task_control_steps_all)
+        logging.info(
+            "Task episode summary: task=%r episodes=%d successes=%d failures=%d "
+            "total_elapsed_s=%.3f mean_elapsed_s_all=%s mean_elapsed_s_success=%s "
+            "total_control_steps=%d mean_control_steps_all=%s mean_control_steps_success=%s timed_episodes=%d",
+            task_description,
+            task_episodes,
+            task_successes,
+            task_episodes - task_successes,
+            task_total_elapsed_s,
+            f"{task_total_elapsed_s / len(task_elapsed_s_all):.3f}" if task_elapsed_s_all else "NA",
+            f"{sum(task_elapsed_s_success) / len(task_elapsed_s_success):.3f}"
+            if task_elapsed_s_success else "NA",
+            task_total_control_steps,
+            f"{task_total_control_steps / len(task_control_steps_all):.2f}" if task_control_steps_all else "NA",
+            f"{sum(task_control_steps_success) / len(task_control_steps_success):.2f}"
+            if task_control_steps_success else "NA",
+            len(task_elapsed_s_all),
+        )
+        suite_control_steps_all.extend(task_control_steps_all)
+        suite_control_steps_success.extend(task_control_steps_success)
+        suite_elapsed_s_all.extend(task_elapsed_s_all)
+        suite_elapsed_s_success.extend(task_elapsed_s_success)
+
         # Log final results
         logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
         logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
 
     logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
     logging.info(f"Total episodes: {total_episodes}")
+    suite_total_elapsed_s = sum(suite_elapsed_s_all)
+    suite_total_control_steps = sum(suite_control_steps_all)
+    logging.info(
+        "Suite episode summary: suite=%s episodes=%d successes=%d failures=%d "
+        "total_elapsed_s=%.3f mean_elapsed_s_all=%s mean_elapsed_s_success=%s "
+        "total_control_steps=%d mean_control_steps_all=%s mean_control_steps_success=%s timed_episodes=%d",
+        args.task_suite_name,
+        total_episodes,
+        total_successes,
+        total_episodes - total_successes,
+        suite_total_elapsed_s,
+        f"{suite_total_elapsed_s / len(suite_elapsed_s_all):.3f}" if suite_elapsed_s_all else "NA",
+        f"{sum(suite_elapsed_s_success) / len(suite_elapsed_s_success):.3f}"
+        if suite_elapsed_s_success else "NA",
+        suite_total_control_steps,
+        f"{suite_total_control_steps / len(suite_control_steps_all):.2f}" if suite_control_steps_all else "NA",
+        f"{sum(suite_control_steps_success) / len(suite_control_steps_success):.2f}"
+        if suite_control_steps_success else "NA",
+        len(suite_elapsed_s_all),
+    )
 
 
 def _get_libero_env(task, resolution, seed):

@@ -1,4 +1,6 @@
 import collections
+import concurrent.futures
+import copy
 import dataclasses
 import logging
 import math
@@ -28,6 +30,7 @@ class Args:
     port: int = 8000
     resize_size: int = 224
     replan_steps: int = 5
+    async_replan: bool = False
 
     #################################################################################################################
     # LIBERO environment-specific parameters
@@ -44,6 +47,73 @@ class Args:
     video_out_path: str = "data/libero/videos"  # Path to save videos
 
     seed: int = 7  # Random Seed (for reproducibility)
+
+
+class _AsyncReplanner:
+    """Overlap policy inference with old actions, then hand over at the current step."""
+
+    def __init__(self, client, replan_steps: int):
+        self._client = client
+        self._replan_steps = replan_steps
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self._actions = collections.deque()
+        self._pending = None
+        self._pending_step = None
+        self._last_request_step = None
+        self._control_step = 0
+
+    def _accept(self, result: dict, elapsed_steps: int) -> None:
+        actions = np.asarray(result["actions"])
+        if len(actions) <= self._replan_steps:
+            raise ValueError("Async replanning requires an action horizon greater than replan_steps.")
+        if not 0 <= elapsed_steps < len(actions):
+            raise RuntimeError(
+                f"Async handover missed the action horizon: elapsed_steps={elapsed_steps}, horizon={len(actions)}."
+            )
+        self._actions = collections.deque(actions[elapsed_steps:])
+
+    def _accept_pending(self) -> None:
+        if self._pending is None or self._pending_step is None:
+            raise RuntimeError("No pending inference to accept.")
+        result = self._pending.result()
+        elapsed_steps = self._control_step - self._pending_step
+        self._accept(result, elapsed_steps)
+        logging.info(
+            "Dynamic handover: request_step=%d accept_step=%d elapsed_steps=%d remaining_actions=%d",
+            self._pending_step,
+            self._control_step,
+            elapsed_steps,
+            len(self._actions),
+        )
+        self._pending = None
+        self._pending_step = None
+
+    def next_action(self, obs: dict) -> np.ndarray:
+        if self._control_step == 0:
+            self._accept(self._client.infer(obs), elapsed_steps=0)
+            self._last_request_step = 0
+        else:
+            if self._pending is not None and (self._pending.done() or not self._actions):
+                self._accept_pending()
+            if (
+                self._pending is None
+                and self._last_request_step is not None
+                and self._control_step - self._last_request_step >= self._replan_steps
+            ):
+                self._pending_step = self._control_step
+                self._last_request_step = self._control_step
+                self._pending = self._executor.submit(self._client.infer, copy.deepcopy(obs))
+            if not self._actions and self._pending is not None:
+                self._accept_pending()
+
+        if not self._actions:
+            raise RuntimeError("Async action buffer is empty.")
+        action = self._actions.popleft()
+        self._control_step += 1
+        return action
+
+    def close(self) -> None:
+        self._executor.shutdown(wait=True)
 
 
 def eval_libero(args: Args) -> None:
@@ -101,6 +171,7 @@ def eval_libero(args: Args) -> None:
             # Reset environment
             env.reset()
             action_plan = collections.deque()
+            async_replanner = _AsyncReplanner(client, args.replan_steps) if args.async_replan else None
 
             # Set initial states
             obs = env.set_init_state(initial_states[episode_idx])
@@ -139,7 +210,7 @@ def eval_libero(args: Args) -> None:
                     # Save preprocessed image for replay video
                     replay_images.append(img)
 
-                    if not action_plan:
+                    if async_replanner is not None or not action_plan:
                         # Finished executing previous action chunk -- compute new chunk
                         # Prepare observations dict
                         element = {
@@ -155,14 +226,18 @@ def eval_libero(args: Args) -> None:
                             "prompt": str(task_description),
                         }
 
-                        # Query model to get action
-                        action_chunk = client.infer(element)["actions"]
-                        assert (
-                            len(action_chunk) >= args.replan_steps
-                        ), f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."
-                        action_plan.extend(action_chunk[: args.replan_steps])
-
-                    action = action_plan.popleft()
+                        if async_replanner is not None:
+                            action = async_replanner.next_action(element)
+                        else:
+                            # Query model to get action
+                            action_chunk = client.infer(element)["actions"]
+                            assert (
+                                len(action_chunk) >= args.replan_steps
+                            ), f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."
+                            action_plan.extend(action_chunk[: args.replan_steps])
+                            action = action_plan.popleft()
+                    else:
+                        action = action_plan.popleft()
 
                     # Execute action in environment
                     obs, reward, done, info = env.step(action.tolist())
@@ -180,6 +255,8 @@ def eval_libero(args: Args) -> None:
             episode_elapsed_s = (
                 time.perf_counter() - episode_start_s if episode_start_s is not None else None
             )
+            if async_replanner is not None:
+                async_replanner.close()
             logging.info(
                 "Episode result: task=%r episode=%d success=%s elapsed_s=%s control_steps=%d",
                 task_description,

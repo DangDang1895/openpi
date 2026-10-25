@@ -25,7 +25,7 @@ class Args:
     # Model server parameters
     #################################################################################################################
     server_url: str = "http://127.0.0.1:8080"
-    client_path: str = "/home/lhs/Works/Jetson-PI-Edge/bridge_local.py"
+    client_path: str = "/home/hs/Works/Jetson-PI-Edge/bridge_local.py"
     resize_size: int = 224
     replan_steps: int = 5
 
